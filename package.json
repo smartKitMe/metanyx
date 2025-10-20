@@ -1,0 +1,31 @@
+{
+  "name": "metanyx",
+  "version": "1.0.0",
+  "description": "CLI to scan file metadata into sqlite and view/update entries",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "metanyx": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "readme.md"
+  ],
+  "scripts": {
+    "dev": "node src/index.js",
+    "build": "vite build",
+    "test": "vitest run",
+    "coverage": "vitest run --coverage",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": ["cli","metadata","sqlite","fs"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "sqlite3": "^5.1.7"
+  },
+  "devDependencies": {
+    "vite": "^5.4.8",
+    "vitest": "^2.1.2"
+  }
+}
