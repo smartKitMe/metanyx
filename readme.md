@@ -2,20 +2,23 @@
 
 一个用于扫描、索引并批量查看/修改文件元数据的小工具。支持通过 sqlite 持久化，提供 CLI 接口进行 read/view/wri/clear/info 操作。
 
-## 安装
+## 安装与发布使用
 
-- 需要 Node.js 18+
-- 安装依赖：`npm install`
-- 可选：若要启用更强的跨平台时间设置支持，安装 `utimes`（已在代码中作为后备）：`npm install utimes --save`
+- 需要 Node.js 18+。
+- 全局安装：`npm install -g metanyx`，之后直接使用 `metanyx <动作> [数据库路径] [选项]`。
+- 一次性运行（无需全局安装）：`npx metanyx <动作> [数据库路径] [选项]`。
+- 项目内安装：`npm install metanyx --save-dev` 或 `npm install metanyx`；之后用 `npx metanyx ...`，或在 `package.json` 添加脚本：
+  - `"scripts": { "metanyx": "metanyx" }`，执行 `npm run metanyx -- <参数>`。
+- 可选原生加速：在当前项目安装 `@ronomon/utimes`：`npm install @ronomon/utimes`（仅当你使用 `npx metanyx` 或在项目中运行时生效）。全局安装可能不会被 CLI 解析到。默认已内置 `utimes`，不可用时回退到 `fs.promises.utimes`。
 
 ## 用法
 
 用法:
 
 ```
-node src/index.js <动作> [数据库路径] [选项]
+metanyx <动作> [数据库路径] [选项]
 或:
-node src/index.js --config <配置文件.json>
+metanyx --config <配置文件.json>
 ```
 
 参数说明:
@@ -67,23 +70,87 @@ node src/index.js --config <配置文件.json>
 - 说明：`fs.utimes` 只能设置 `atime/mtime`，`ctime` 由文件系统在变更时自动更新，无法直接设置。
 - 修复：新增 `--ctime-touch`，在执行时间修改后对文件进行一次安全重命名（到临时名再改回），从而触发文件系统刷新 `ctime`。
 - 验证：执行如下命令并观察 `ctime_ms` 与 `ctime_human` 是否变化。
-  - `node src/index.js view --mode search --ext md --json`
-  - `node src/index.js wri --op time --time-all "+10d" --ctime-touch --ext md --json`
+  - `metanyx view --mode search --ext md --json`
+  - `metanyx wri --op time --time-all "+10d" --ctime-touch --ext md --json`
 
 ## 使用示例
 
-- 索引 `node_modules`：`node src/index.js read ./node_modules`
-- 查看某目录 `.js` 文件：`node src/index.js view --mode list --under ./src --ext .js --json`
-- 批量修改 `.md` 的时间并刷新 ctime：`node src/index.js wri --op time --time-all "+10d" --ctime-touch --ext md --json`
+- 索引 `node_modules`：`metanyx read ./node_modules`
+- 查看某目录 `.js` 文件：`metanyx view --mode list --under ./src --ext .js --json`
+- 批量修改 `.md` 的时间并刷新 ctime：`metanyx wri --op time --time-all "+10d" --ctime-touch --ext md --json`
 
 ## 常见问题
 
 - `SQLITE_CANTOPEN`: 请确保第二参数是 `targetPath`（仅限 `read`），第三参数才是数据库路径。例如：
-  - 正确：`node src/index.js read ./docs` 或 `node src/index.js read ./docs ./data.db`
-  - 错误：`node src/index.js read ./node_modules` 被当作 dbPath 时会报错，现已修复入口解析以避免误判
+  - 正确：`metanyx read ./docs` 或 `metanyx read ./docs ./data.db`
+  - 错误：`metanyx read ./node_modules` 被当作 dbPath 时会报错，现已修复入口解析以避免误判
 - 无匹配文件：请检查过滤条件是否正确，尤其是 `--under` 是否为存在的目录；在 `search` 模式下我们会自动规范为绝对路径。
 
 ## 输出形式
 
 - `--table` 默认输出为表格；`--json` 强制输出 JSON。
 - `view` 支持指定字段：`--fields full_path,mtime_human,ctime_human`。
+- `wri` 非 JSON 输出为人类可读时间：`YYYY-MM-DD HH:mm:ss`。
+
+## 快速开始
+
+- 初始化并索引：`metanyx read ./your-dir`
+- 查看文件：`metanyx view --mode search --ext md --fields full_path,mtime_human,ctime_human --json`
+- 批量修改时间：`metanyx wri --op time --time-all "+10m" --ctime-touch --ext md --table`
+- 修改权限：`metanyx wri --op chmod --under ./src --ext .js --chmod 644`
+- 重命名：`metanyx wri --op rename --under ./src --ext .js --new-name index.js`
+
+## 配置文件示例
+
+- 使用 `--config config.json` 运行。示例：
+
+```json
+{
+  "action": "view",
+  "dbPath": "metanyx.db",
+  "view": {
+    "mode": "search",
+    "fields": ["full_path", "mtime_human", "ctime_human"],
+    "filters": { "ext": "md", "mtime_from": "2024-01-01", "under": "./docs" },
+    "json": true
+  }
+}
+```
+
+- 批量修改时间示例：
+
+```json
+{
+  "action": "wri",
+  "wri": { "op": "time", "extra": { "time_all": "+10m", "ctime_touch": true } },
+  "view": { "filters": { "ext": "md" } },
+  "json": true
+}
+```
+
+## 短别名速查
+
+- 名称：`--view-name` | `--name`
+- 扩展名：`--view-ext` | `--ext`
+- 路径前缀：`--view-under` | `--under`
+- mtime下限：`--view-mtime-from` | `--mtime-from`
+- mtime上限：`--view-mtime-to` | `--mtime-to`
+- ctime下限：`--view-ctime-from` | `--ctime-from`
+- ctime上限：`--view-ctime-to` | `--ctime-to`
+- 最小/最大大小：`--view-size-min` | `--size-min`，`--view-size-max` | `--size-max`
+- 类型：`--view-type` | `--type`
+
+## 时间字符串支持
+
+- 支持：`YYYY-MM-DD`、`YYYY-MM-DD HH:mm`、`YYYY-MM-DD HH:mm:ss`、`YYYY-MM-DDTHH:mm[:ss]`、`now`
+- 边界补全：
+  - `from`: 无秒时补全到 `:00:00.000`
+  - `to`: 无秒时补全到 `:59:59.999`
+- 配置文件与 CLI 均支持字符串时间。无法解析将报错退出。
+
+## 安全与平台说明
+
+- `ctime` 无法直接设定，使用 `--ctime-touch` 触发刷新。
+- 优先 `@ronomon/utimes`，其次 `utimes`，最后 `fs.promises.utimes`。在某些平台上可能无法设置 `btime`。
+- `rename` 在多文件场景可能覆盖同名文件，务必谨慎。
+- 读取 `node_modules` 等大型目录会花费时间与空间，请按需过滤。
