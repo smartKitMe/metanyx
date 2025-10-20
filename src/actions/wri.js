@@ -1,124 +1,153 @@
 import fs from 'node:fs';
-import { initDb, closeDb, upsertEntry } from '../db.js';
-import { normalizeAbsolute, readMeta } from '../utils/meta.js';
-import { renderOps } from '../utils/print.js';
-import { performSearch, extractFilePaths } from '../utils/search.js';
+import path from 'node:path';
+import { normalizeAbsolute } from '../utils/meta.js';
+import { performSearch } from '../utils/search.js';
+import { initDb, closeDb } from '../db.js';
 
-// 修改元数据支持：
-// - touch: 更新 mtime/ctime 为当前时间（读取后写回数据库，不改文件本身）
-// - rename: 重命名文件（在文件系统执行，并更新数据库记录）
-// - chmod: 修改权限（在文件系统执行，并更新数据库记录）
-// - time: 通过增量语法修改 atime/mtime（ctime 由系统维护，最终以系统为准）
-// options: { action: 'touch'|'rename'|'chmod'|'time', dbPath, extra, filters, json }
-export async function execute({ action, dbPath, extra, filters, json }) {
-  const absDbPath = dbPath ? normalizeAbsolute(dbPath) : normalizeAbsolute('metanyx.db');
+function parseDelta(deltaStr) {
+  // 支持形如 +10d, -3h, +30m, -45s, +500ms 的增量
+  // 也支持复合：+1h30m
+  if (!deltaStr) return 0;
+  const m = String(deltaStr).trim();
+  const sign = m.startsWith('-') ? -1 : 1;
+  const s = m.replace(/^[-+]/, '');
+  const re = /(\d+)(d|h|m|s|ms)/g;
+  let total = 0;
+  let match;
+  while ((match = re.exec(s)) !== null) {
+    const val = Number(match[1]);
+    const unit = match[2];
+    if (unit === 'd') total += val * 24 * 60 * 60 * 1000;
+    else if (unit === 'h') total += val * 60 * 60 * 1000;
+    else if (unit === 'm') total += val * 60 * 1000;
+    else if (unit === 's') total += val * 1000;
+    else if (unit === 'ms') total += val;
+  }
+  return sign * total;
+}
 
+async function applyTimes(p, { mtimeDelta, atimeDelta }) {
+  const stat = fs.statSync(p);
+  const atimeMs = stat.atimeMs + (atimeDelta || 0);
+  const mtimeMs = stat.mtimeMs + (mtimeDelta || 0);
+  const atime = new Date(atimeMs);
+  const mtime = new Date(mtimeMs);
+  // 使用 utimes 设置 atime/mtime
+  await fs.promises.utimes(p, atime, mtime);
+}
+
+async function touchCtime(p) {
+  // 通过安全重命名触发 ctime 变化：重命名到临时名，再改回
+  const dir = path.dirname(p);
+  const base = path.basename(p);
+  const temp = path.join(dir, `.${base}.ctime_touch_${Date.now()}`);
+  // 确保临时名不存在
+  await fs.promises.rename(p, temp);
+  await fs.promises.rename(temp, p);
+}
+
+export async function execute({ action, dbPath, filters, extra, json }) {
+  const dbAbs = normalizeAbsolute(dbPath || 'metanyx.db');
   let db;
-  const ops = [];
   try {
-    db = await initDb(absDbPath);
+    db = await initDb(dbAbs);
+    const { rows } = await performSearch(db, { targetPath: undefined, mode: 'search', filters: filters || {} });
+    if (action === 'time') {
+      const mtimeDelta = parseDelta(extra?.mtime || extra?.time_all);
+      const atimeDelta = parseDelta(extra?.atime || extra?.time_all);
+      const ctimeTouch = !!extra?.ctime_touch;
+
+      const results = [];
+      for (const t of rows) {
+        try {
+          await applyTimes(t.full_path, { mtimeDelta, atimeDelta });
+          if (ctimeTouch) {
+            await touchCtime(t.full_path);
+          }
+          const s = fs.statSync(t.full_path);
+          results.push({
+            full_path: t.full_path,
+            atime_ms: s.atimeMs,
+            mtime_ms: s.mtimeMs,
+            ctime_ms: s.ctimeMs,
+          });
+        } catch (e) {
+          results.push({ full_path: t.full_path, error: String(e) });
+        }
+      }
+      if (json) {
+        console.log(JSON.stringify(results, null, 2));
+      } else {
+        for (const r of results) {
+          if (r.error) console.log(`${r.full_path} -> ERROR: ${r.error}`);
+          else console.log(`${r.full_path} -> atime_ms=${r.atime_ms} mtime_ms=${r.mtime_ms} ctime_ms=${r.ctime_ms}`);
+        }
+      }
+      return;
+    }
 
     if (action === 'touch') {
-      // 基于数据库过滤选择目标（仅 file）
-      const { rows } = await performSearch(db, { targetPath: undefined, mode: 'search', filters });
-      const targets = extractFilePaths(rows);
-      if (!targets.length) {
-        ops.push({ op: 'touch', path: '', result: '无匹配文件' });
+      const results = [];
+      for (const t of rows) {
+        try {
+          const now = new Date();
+          await fs.promises.utimes(t.full_path, now, now);
+          const s = fs.statSync(t.full_path);
+          results.push({ full_path: t.full_path, atime_ms: s.atimeMs, mtime_ms: s.mtimeMs, ctime_ms: s.ctimeMs });
+        } catch (e) {
+          results.push({ full_path: t.full_path, error: String(e) });
+        }
       }
-      for (const absTarget of targets) {
-        const stat = await fs.promises.lstat(absTarget);
-        const meta = await readMeta(absTarget, stat);
-        meta.mtime_ms = Date.now();
-        meta.ctime_ms = Date.now();
-        await upsertEntry(db, meta);
-        ops.push({ op: 'touch', path: absTarget, result: '记录时间戳已更新' });
-      }
-    } else if (action === 'rename') {
-      // rename 需要提供新的名称，通过过滤选中唯一文件时生效；多文件将按同名规则覆盖
-      const newName = extra?.newName;
-      if (!newName) throw new Error('rename 需要提供 extra.newName');
-      const { rows } = await performSearch(db, { targetPath: undefined, mode: 'search', filters });
-      const targets = extractFilePaths(rows);
-      if (!targets.length) {
-        ops.push({ op: 'rename', path: '', result: '无匹配文件' });
-      }
-      for (const absTarget of targets) {
-        const dir = absTarget.substring(0, absTarget.lastIndexOf('/'));
-        const newPath = `${dir}/${newName}`;
-        await fs.promises.rename(absTarget, newPath);
-        const newStat = await fs.promises.lstat(newPath);
-        const meta = await readMeta(newPath, newStat);
-        await upsertEntry(db, meta);
-        ops.push({ op: 'rename', path: newPath, result: '已重命名' });
-      }
-    } else if (action === 'chmod') {
-      const mode = extra?.mode;
-      if (typeof mode !== 'number') throw new Error('chmod 需要提供数字类型 extra.mode');
-      const { rows } = await performSearch(db, { targetPath: undefined, mode: 'search', filters });
-      const targets = extractFilePaths(rows);
-      if (!targets.length) {
-        ops.push({ op: 'chmod', path: '', result: '无匹配文件' });
-      }
-      for (const absTarget of targets) {
-        await fs.promises.chmod(absTarget, mode);
-        const newStat = await fs.promises.lstat(absTarget);
-        const meta = await readMeta(absTarget, newStat);
-        await upsertEntry(db, meta);
-        ops.push({ op: 'chmod', path: absTarget, result: `权限=${mode}` });
-      }
-    } else if (action === 'time') {
-      const { rows } = await performSearch(db, { targetPath: undefined, mode: 'search', filters });
-      const targets = extractFilePaths(rows);
-      if (!targets.length) {
-        ops.push({ op: 'time', path: '', result: '无匹配文件' });
-      }
-      const deltaAll = extra?.time_all ? parseDelta(extra.time_all) : 0;
-      const deltaM = extra?.mtime ? parseDelta(extra.mtime) : 0;
-      const deltaA = extra?.atime ? parseDelta(extra.atime) : 0;
-
-      for (const fp of targets) {
-        const stat = await fs.promises.lstat(fp);
-        const currentM = stat.mtimeMs;
-        const currentA = stat.atimeMs;
-        const newM = currentM + deltaAll + deltaM;
-        const newA = currentA + deltaAll + deltaA;
-        const newAtimeDate = new Date(newA);
-        const newMtimeDate = new Date(newM);
-        await fs.promises.utimes(fp, newAtimeDate, newMtimeDate);
-        const newStat = await fs.promises.lstat(fp);
-        const meta = await readMeta(fp, newStat);
-        await upsertEntry(db, meta);
-        ops.push({ op: 'time', path: fp, result: `atime=${newAtimeDate.toISOString()} mtime=${newMtimeDate.toISOString()}` });
-      }
-      ops.push({ op: 'time', path: '', result: '完成（ctime 以系统为准）' });
-    } else {
-      throw new Error(`未知 wri 操作: ${action}`);
+      if (json) console.log(JSON.stringify(results, null, 2));
+      else results.forEach((r) => console.log(r.error ? `${r.full_path} -> ERROR: ${r.error}` : `${r.full_path} -> touched`));
+      return;
     }
-  } catch (err) {
-    console.error('wri 动作执行失败:', err);
-    process.exitCode = 1;
+
+    if (action === 'chmod') {
+      const mode = extra?.mode;
+      if (typeof mode !== 'number') {
+        console.error('chmod 需要使用 --chmod 指定权限');
+        process.exit(1);
+      }
+      const results = [];
+      for (const t of rows) {
+        try {
+          await fs.promises.chmod(t.full_path, mode);
+          results.push({ full_path: t.full_path, mode });
+        } catch (e) {
+          results.push({ full_path: t.full_path, error: String(e) });
+        }
+      }
+      if (json) console.log(JSON.stringify(results, null, 2));
+      else results.forEach((r) => console.log(r.error ? `${r.full_path} -> ERROR: ${r.error}` : `${r.full_path} -> chmod ${mode}`));
+      return;
+    }
+
+    if (action === 'rename') {
+      const newName = extra?.newName;
+      if (!newName) {
+        console.error('rename 需要使用 --new-name 指定新文件名');
+        process.exit(1);
+      }
+      const results = [];
+      for (const t of rows) {
+        try {
+          const dir = path.dirname(t.full_path);
+          const dest = path.join(dir, newName);
+          await fs.promises.rename(t.full_path, dest);
+          results.push({ from: t.full_path, to: dest });
+        } catch (e) {
+          results.push({ full_path: t.full_path, error: String(e) });
+        }
+      }
+      if (json) console.log(JSON.stringify(results, null, 2));
+      else results.forEach((r) => console.log(r.error ? `${r.full_path} -> ERROR: ${r.error}` : `${r.full_path} -> renamed`));
+      return;
+    }
+
+    console.error(`未知 wri 操作: ${action}`);
+    process.exit(1);
   } finally {
     if (db) closeDb(db);
   }
-  renderOps(ops, { json });
-}
-
-function parseDelta(expr) {
-  if (!expr) return 0;
-  const m = String(expr).trim();
-  const regex = /([+-]?\d+)(d|h|m|s|ms)/g;
-  let match;
-  let total = 0;
-  while ((match = regex.exec(m)) !== null) {
-    const val = parseInt(match[1], 10);
-    const unit = match[2];
-    const factor = unit === 'd' ? 24*60*60*1000
-      : unit === 'h' ? 60*60*1000
-      : unit === 'm' ? 60*1000
-      : unit === 's' ? 1000
-      : unit === 'ms' ? 1
-      : 0;
-    total += val * factor;
-  }
-  return total;
 }
