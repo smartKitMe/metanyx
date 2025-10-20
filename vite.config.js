@@ -14,9 +14,9 @@ export default defineConfig({
       external: [
         'sqlite3',
         // Node builtins (ESM names)
-        'node:fs', 'node:path', 'node:url', 'node:crypto',
+        'node:fs', 'node:path', 'node:url', 'node:crypto', 'node:module',
         // Compatibility for CommonJS import paths
-        'fs', 'path', 'url', 'crypto',
+        'fs', 'path', 'url', 'crypto', 'module',
       ],
       output: {
         // Ensure CLI shebang present

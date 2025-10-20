@@ -11,6 +11,9 @@
     "dist",
     "readme.md"
   ],
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/"
+  },
   "scripts": {
     "dev": "node src/index.js",
     "build": "vite build",
