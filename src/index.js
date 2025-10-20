@@ -88,12 +88,23 @@ function parseArgs(argv) {
   // 1) <动作> [db] [flags]
   if (allowed.includes(args[0])) {
     action = args[0];
-    const second = args[1];
-    if (second && !second.startsWith('--') && !allowed.includes(second)) {
-      dbPath = second;
-      startIdx = 2;
+    if (action === 'read') {
+      // read 的参数顺序：read <targetPath> [dbPath] [flags]
+      const third = args[2];
+      if (third && !third.startsWith('--') && !allowed.includes(third)) {
+        dbPath = third;
+        startIdx = 3; // flags 从第三个参数之后开始
+      } else {
+        startIdx = 2; // flags 从第二个参数之后开始（仅提供 targetPath）
+      }
     } else {
-      startIdx = 1;
+      const second = args[1];
+      if (second && !second.startsWith('--') && !allowed.includes(second)) {
+        dbPath = second;
+        startIdx = 2;
+      } else {
+        startIdx = 1;
+      }
     }
   } else {
     console.error('参数解析失败：仅支持新顺序 <动作> [数据库路径] [选项]');
