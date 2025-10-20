@@ -18,11 +18,17 @@
     "coverage": "vitest run --coverage",
     "prepublishOnly": "npm run build && npm test"
   },
-  "keywords": ["cli","metadata","sqlite","fs"],
+  "keywords": [
+    "cli",
+    "metadata",
+    "sqlite",
+    "fs"
+  ],
   "author": "",
   "license": "ISC",
   "dependencies": {
-    "sqlite3": "^5.1.7"
+    "sqlite3": "^5.1.7",
+    "utimes": "^5.2.1"
   },
   "devDependencies": {
     "vite": "^5.4.8",

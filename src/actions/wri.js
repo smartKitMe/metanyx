@@ -1,8 +1,21 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { normalizeAbsolute } from '../utils/meta.js';
+import { normalizeAbsolute, formatTimestamp } from '../utils/meta.js';
 import { performSearch } from '../utils/search.js';
 import { initDb, closeDb } from '../db.js';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+let utimesNative = null;
+let utimesCompat = null;
+try { utimesNative = require('@ronomon/utimes'); } catch (e) {}
+try { utimesCompat = require('utimes'); } catch (e) {}
+
+function getTimeImpl() {
+  if (utimesNative && typeof utimesNative.utimes === 'function') return '@ronomon/utimes';
+  if (utimesCompat && utimesCompat.utimes) return 'utimes';
+  return 'fs.promises.utimes';
+}
 
 function parseDelta(deltaStr) {
   // 支持形如 +10d, -3h, +30m, -45s, +500ms 的增量
@@ -26,14 +39,27 @@ function parseDelta(deltaStr) {
   return sign * total;
 }
 
+async function setTimes(p, { atimeMs, mtimeMs }) {
+  // 优先使用 @ronomon/utimes，其次使用 utimes 包，最后降级到 fs.utimes
+  if (utimesNative && typeof utimesNative.utimes === 'function') {
+    await new Promise((resolve, reject) => {
+      // btime 传 undefined，避免修改创建时间
+      utimesNative.utimes(p, undefined, mtimeMs, atimeMs, (err) => (err ? reject(err) : resolve()));
+    });
+    return;
+  }
+  if (utimesCompat && utimesCompat.utimes) {
+    await utimesCompat.utimes(p, { mtime: mtimeMs, atime: atimeMs });
+    return;
+  }
+  await fs.promises.utimes(p, new Date(atimeMs), new Date(mtimeMs));
+}
+
 async function applyTimes(p, { mtimeDelta, atimeDelta }) {
   const stat = fs.statSync(p);
   const atimeMs = stat.atimeMs + (atimeDelta || 0);
   const mtimeMs = stat.mtimeMs + (mtimeDelta || 0);
-  const atime = new Date(atimeMs);
-  const mtime = new Date(mtimeMs);
-  // 使用 utimes 设置 atime/mtime
-  await fs.promises.utimes(p, atime, mtime);
+  await setTimes(p, { atimeMs, mtimeMs });
 }
 
 async function touchCtime(p) {
@@ -46,13 +72,18 @@ async function touchCtime(p) {
   await fs.promises.rename(temp, p);
 }
 
-export async function execute({ action, dbPath, filters, extra, json }) {
+export async function execute({ dbPath, filters, extra, json, op }) {
   const dbAbs = normalizeAbsolute(dbPath || 'metanyx.db');
   let db;
   try {
     db = await initDb(dbAbs);
     const { rows } = await performSearch(db, { targetPath: undefined, mode: 'search', filters: filters || {} });
+    const action = op || extra?.action;
+
     if (action === 'time') {
+      const implMsg = `[wri] time impl: ${getTimeImpl()}`;
+      if (json) console.error(implMsg); else console.log(implMsg);
+
       const mtimeDelta = parseDelta(extra?.mtime || extra?.time_all);
       const atimeDelta = parseDelta(extra?.atime || extra?.time_all);
       const ctimeTouch = !!extra?.ctime_touch;
@@ -79,14 +110,23 @@ export async function execute({ action, dbPath, filters, extra, json }) {
         console.log(JSON.stringify(results, null, 2));
       } else {
         for (const r of results) {
-          if (r.error) console.log(`${r.full_path} -> ERROR: ${r.error}`);
-          else console.log(`${r.full_path} -> atime_ms=${r.atime_ms} mtime_ms=${r.mtime_ms} ctime_ms=${r.ctime_ms}`);
+          if (r.error) {
+            console.log(`${r.full_path} -> ERROR: ${r.error}`);
+          } else {
+            const ah = formatTimestamp(r.atime_ms);
+            const mh = formatTimestamp(r.mtime_ms);
+            const ch = formatTimestamp(r.ctime_ms);
+            console.log(`${r.full_path} -> atime=${ah} mtime=${mh} ctime=${ch}`);
+          }
         }
       }
       return;
     }
 
     if (action === 'touch') {
+      const implMsg = `[wri] touch impl: fs.promises.utimes`;
+      if (json) console.error(implMsg); else console.log(implMsg);
+
       const results = [];
       for (const t of rows) {
         try {
@@ -99,7 +139,18 @@ export async function execute({ action, dbPath, filters, extra, json }) {
         }
       }
       if (json) console.log(JSON.stringify(results, null, 2));
-      else results.forEach((r) => console.log(r.error ? `${r.full_path} -> ERROR: ${r.error}` : `${r.full_path} -> touched`));
+      else {
+        for (const r of results) {
+          if (r.error) {
+            console.log(`${r.full_path} -> ERROR: ${r.error}`);
+          } else {
+            const ah = formatTimestamp(r.atime_ms);
+            const mh = formatTimestamp(r.mtime_ms);
+            const ch = formatTimestamp(r.ctime_ms);
+            console.log(`${r.full_path} -> touched atime=${ah} mtime=${mh} ctime=${ch}`);
+          }
+        }
+      }
       return;
     }
 

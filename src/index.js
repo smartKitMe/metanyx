@@ -6,6 +6,7 @@ import { execute as viewExecute } from './actions/view.js';
 import { execute as wriExecute } from './actions/wri.js';
 import { execute as clearExecute } from './actions/clear.js';
 import { execute as infoExecute } from './actions/info.js';
+import { parseTimeString } from './utils/meta.js';
 
 function printUsage() {
   console.log(`用法:
@@ -36,18 +37,20 @@ wri 时间修改（增量语法，+ 表示增加，- 表示减少；单位：d/h
   --time-all "+10m"    同时修改 atime/mtime（示例：统一加 10 分钟）
   --ctime-touch         额外刷新 ctime（通过安全重命名触发，ctime 为系统当前时间；无法设置为任意时间）
 
-view 搜索过滤（可组合使用，支持短别名）：
+view 搜索过滤（可组合使用，支持短别名；时间边界支持字符串输入）：
   --view-name/--name <substr>        按名称子串匹配
   --view-ext/--ext <ext|.ext>        按后缀精确匹配，如 js 或 .js
   --view-under/--under <dir>         限定在某目录前缀下（list 模式需要提供）
-  --view-mtime-from/--mtime-from <ms> 修改时间下限（毫秒）
-  --view-mtime-to/--mtime-to <ms>     修改时间上限（毫秒）
-  --view-ctime-from/--ctime-from <ms> 创建时间下限（毫秒）
-  --view-ctime-to/--ctime-to <ms>     创建时间上限（毫秒）
+  --view-mtime-from/--mtime-from <time> 修改时间下限（字符串，如 2024-10-01 或 2024-10-01 12:00[:30] 或 now）
+  --view-mtime-to/--mtime-to <time>     修改时间上限（字符串，同上；无秒时自动补全到 59:59.999）
+  --view-ctime-from/--ctime-from <time> 创建时间下限（字符串）
+  --view-ctime-to/--ctime-to <time>     创建时间上限（字符串）
   --view-size-min/--size-min <bytes>  文件大小下限（字节）
   --view-size-max/--size-max <bytes>  文件大小上限（字节）
   --view-type/--type file|dir         类型过滤（search 默认仅 file；list 已过滤目录）
-  注：无过滤参数时默认检索全库；存在过滤参数时默认 type=file
+  注：
+    - 时间字符串支持：YYYY-MM-DD、YYYY-MM-DD HH:mm、YYYY-MM-DD HH:mm:ss、YYYY-MM-DDTHH:mm[:ss]、now（本地时区）
+    - 无过滤参数时默认检索全库；存在过滤参数时默认 type=file
 
 示例:
   node src/index.js read ./docs
@@ -170,13 +173,33 @@ function parseFlags(flags) {
     } else if (f === '--view-under' || f === '--under') {
       out.view_under = flags[++i];
     } else if (f === '--view-mtime-from' || f === '--mtime-from') {
-      out.view_mtime_from = Number(flags[++i]);
+      const v = flags[++i];
+      out.view_mtime_from = parseTimeString(v, 'from');
+      if (out.view_mtime_from === undefined) {
+        console.error(`无法解析 --mtime-from 时间字符串: ${v}`);
+        process.exit(1);
+      }
     } else if (f === '--view-mtime-to' || f === '--mtime-to') {
-      out.view_mtime_to = Number(flags[++i]);
+      const v = flags[++i];
+      out.view_mtime_to = parseTimeString(v, 'to');
+      if (out.view_mtime_to === undefined) {
+        console.error(`无法解析 --mtime-to 时间字符串: ${v}`);
+        process.exit(1);
+      }
     } else if (f === '--view-ctime-from' || f === '--ctime-from') {
-      out.view_ctime_from = Number(flags[++i]);
+      const v = flags[++i];
+      out.view_ctime_from = parseTimeString(v, 'from');
+      if (out.view_ctime_from === undefined) {
+        console.error(`无法解析 --ctime-from 时间字符串: ${v}`);
+        process.exit(1);
+      }
     } else if (f === '--view-ctime-to' || f === '--ctime-to') {
-      out.view_ctime_to = Number(flags[++i]);
+      const v = flags[++i];
+      out.view_ctime_to = parseTimeString(v, 'to');
+      if (out.view_ctime_to === undefined) {
+        console.error(`无法解析 --ctime-to 时间字符串: ${v}`);
+        process.exit(1);
+      }
     } else if (f === '--view-size-min' || f === '--size-min') {
       out.view_size_min = Number(flags[++i]);
     } else if (f === '--view-size-max' || f === '--size-max') {
@@ -241,6 +264,25 @@ async function main() {
   // 统一默认数据库路径
   const effectiveDb = cfg.dbPath || 'metanyx.db';
 
+  // 兼容配置文件的时间字符串过滤（将字符串转换为毫秒）
+  const f = cfg.view && cfg.view.filters ? cfg.view.filters : null;
+  if (f) {
+    const ensureNum = (key, bound) => {
+      if (typeof f[key] === 'string') {
+        const v = parseTimeString(f[key], bound);
+        if (v === undefined) {
+          console.error(`配置中的 ${key} 时间字符串无法解析: ${f[key]}`);
+          process.exit(1);
+        }
+        f[key] = v;
+      }
+    };
+    ensureNum('mtime_from', 'from');
+    ensureNum('mtime_to', 'to');
+    ensureNum('ctime_from', 'from');
+    ensureNum('ctime_to', 'to');
+  }
+
   if (cfg.action === 'read') {
     const tp = argv[1] && !argv[1].startsWith('--') ? argv[1] : undefined;
     const targetPath = tp || undefined;
@@ -248,32 +290,19 @@ async function main() {
       console.error('read 动作需要提供目标路径');
       process.exit(1);
     }
-    await clearExecute({ dbPath: effectiveDb });
-    await readExecute({ targetPath, dbPath: effectiveDb, json: cfg.view?.json });
+    await readExecute({ dbPath: effectiveDb, targetPath, json: cfg.view.json, table: cfg.view.table });
   } else if (cfg.action === 'view') {
-    await viewExecute({
-      dbPath: effectiveDb,
-      mode: cfg.view?.mode,
-      fields: cfg.view?.fields,
-      filters: cfg.view?.filters,
-      table: cfg.view?.table,
-      json: cfg.view?.json,
-    });
+    await viewExecute({ dbPath: effectiveDb, mode: cfg.view.mode, fields: cfg.view.fields, filters: cfg.view.filters, table: cfg.view.table, json: cfg.view.json });
   } else if (cfg.action === 'wri') {
-    const op = cfg.wri?.op;
-    if (!op) {
-      console.error('wri 需要通过 --op 或配置提供具体操作');
-      process.exit(1);
-    }
-    await wriExecute({ action: op, dbPath: effectiveDb, extra: cfg.wri?.extra, filters: cfg.view?.filters, json: cfg.view?.json });
+    await wriExecute({ dbPath: effectiveDb, op: cfg.wri.op, extra: cfg.wri.extra, filters: cfg.view.filters, json: cfg.view.json, table: cfg.view.table });
   } else if (cfg.action === 'clear') {
-    await clearExecute({ dbPath: effectiveDb });
+    await clearExecute({ dbPath: effectiveDb, json: cfg.view.json, table: cfg.view.table });
   } else if (cfg.action === 'info') {
-    await infoExecute({ dbPath: effectiveDb });
+    await infoExecute({ dbPath: effectiveDb, json: cfg.view.json, table: cfg.view.table });
   }
 }
 
 main().catch((e) => {
-  console.error('执行失败:', e);
+  console.error('程序执行失败:', e);
   process.exitCode = 1;
 });
